@@ -1867,14 +1867,11 @@ free_monitoring_data(_PyCoMonitoringData *data)
 static void
 code_dealloc(PyCodeObject *co)
 {
-    assert(Py_REFCNT(co) == 0);
-    Py_SET_REFCNT(co, 1);
+    _PyObject_ResurrectStart((PyObject *)co);
     notify_code_watchers(PY_CODE_EVENT_DESTROY, co);
-    if (Py_REFCNT(co) > 1) {
-        Py_SET_REFCNT(co, Py_REFCNT(co) - 1);
+    if (_PyObject_ResurrectEnd((PyObject *)co)) {
         return;
     }
-    Py_SET_REFCNT(co, 0);
 
 #ifdef Py_GIL_DISABLED
     PyObject_GC_UnTrack(co);
@@ -2895,20 +2892,22 @@ get_indices_in_use(PyInterpreterState *interp, struct flag_set *in_use)
     assert(interp->stoptheworld.world_stopped);
     assert(in_use->flags == NULL);
     int32_t max_index = 0;
-    for (PyThreadState *p = interp->threads.head; p != NULL; p = p->next) {
+    _Py_FOR_EACH_TSTATE_BEGIN(interp, p) {
         int32_t idx = ((_PyThreadStateImpl *) p)->tlbc_index;
         if (idx > max_index) {
             max_index = idx;
         }
     }
+    _Py_FOR_EACH_TSTATE_END(interp);
     in_use->size = (size_t) max_index + 1;
     in_use->flags = PyMem_Calloc(in_use->size, sizeof(*in_use->flags));
     if (in_use->flags == NULL) {
         return -1;
     }
-    for (PyThreadState *p = interp->threads.head; p != NULL; p = p->next) {
+    _Py_FOR_EACH_TSTATE_BEGIN(interp, p) {
         in_use->flags[((_PyThreadStateImpl *) p)->tlbc_index] = 1;
     }
+    _Py_FOR_EACH_TSTATE_END(interp);
     return 0;
 }
 

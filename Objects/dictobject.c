@@ -1285,6 +1285,20 @@ ensure_shared_on_resize(PyDictObject *mp)
 #endif
 }
 
+static inline void
+ensure_shared_on_keys_version_assignment(PyDictObject *mp)
+{
+    ASSERT_DICT_LOCKED((PyObject *) mp);
+    #ifdef Py_GIL_DISABLED
+    if (!IS_DICT_SHARED(mp)) {
+        // This ensures that a concurrent resize operation will delay
+        // freeing the old keys or values using QSBR, which is necessary to
+        // safely allow concurrent reads without locking.
+        SET_DICT_SHARED(mp);
+    }
+    #endif
+}
+
 #ifdef Py_GIL_DISABLED
 
 static inline Py_ALWAYS_INLINE int
@@ -1644,7 +1658,7 @@ insert_combined_dict(PyInterpreterState *interp, PyDictObject *mp,
     }
 
     _PyDict_NotifyEvent(interp, PyDict_EVENT_ADDED, mp, key, value);
-    mp->ma_keys->dk_version = 0;
+    FT_ATOMIC_STORE_UINT32_RELAXED(mp->ma_keys->dk_version, 0);
 
     Py_ssize_t hashpos = find_empty_slot(mp->ma_keys, hash);
     dictkeys_set_index(mp->ma_keys, hashpos, mp->ma_keys->dk_nentries);
@@ -1686,7 +1700,7 @@ insert_split_key(PyDictKeysObject *keys, PyObject *key, Py_hash_t hash)
     ix = unicodekeys_lookup_unicode(keys, key, hash);
     if (ix == DKIX_EMPTY && keys->dk_usable > 0) {
         // Insert into new slot
-        keys->dk_version = 0;
+        FT_ATOMIC_STORE_UINT32_RELAXED(keys->dk_version, 0);
         Py_ssize_t hashpos = find_empty_slot(keys, hash);
         ix = keys->dk_nentries;
         dictkeys_set_index(keys, hashpos, ix);
@@ -2617,7 +2631,7 @@ delitem_common(PyDictObject *mp, Py_hash_t hash, Py_ssize_t ix,
         ASSERT_CONSISTENT(mp);
     }
     else {
-        mp->ma_keys->dk_version = 0;
+        FT_ATOMIC_STORE_UINT32_RELAXED(mp->ma_keys->dk_version, 0);
         dictkeys_set_index(mp->ma_keys, hashpos, DKIX_DUMMY);
         if (DK_IS_UNICODE(mp->ma_keys)) {
             PyDictUnicodeEntry *ep = &DK_UNICODE_ENTRIES(mp->ma_keys)[ix];
@@ -3148,14 +3162,11 @@ dict_dealloc(PyObject *self)
 {
     PyDictObject *mp = (PyDictObject *)self;
     PyInterpreterState *interp = _PyInterpreterState_GET();
-    assert(Py_REFCNT(mp) == 0);
-    Py_SET_REFCNT(mp, 1);
+    _PyObject_ResurrectStart(self);
     _PyDict_NotifyEvent(interp, PyDict_EVENT_DEALLOCATED, mp, NULL, NULL);
-    if (Py_REFCNT(mp) > 1) {
-        Py_SET_REFCNT(mp, Py_REFCNT(mp) - 1);
+    if (_PyObject_ResurrectEnd(self)) {
         return;
     }
-    Py_SET_REFCNT(mp, 0);
     PyDictValues *values = mp->ma_values;
     PyDictKeysObject *keys = mp->ma_keys;
     Py_ssize_t i, n;
@@ -4429,7 +4440,7 @@ dict_popitem_impl(PyDictObject *self)
             return NULL;
         }
     }
-    self->ma_keys->dk_version = 0;
+    FT_ATOMIC_STORE_UINT32_RELAXED(self->ma_keys->dk_version, 0);
 
     /* Pop last item */
     PyObject *key, *value;
@@ -7053,9 +7064,7 @@ int
 PyObject_VisitManagedDict(PyObject *obj, visitproc visit, void *arg)
 {
     PyTypeObject *tp = Py_TYPE(obj);
-    if((tp->tp_flags & Py_TPFLAGS_MANAGED_DICT) == 0) {
-        return 0;
-    }
+    assert(tp->tp_flags & Py_TPFLAGS_MANAGED_DICT);
     if (tp->tp_flags & Py_TPFLAGS_INLINE_VALUES) {
         PyDictValues *values = _PyObject_InlineValues(obj);
         if (values->valid) {
@@ -7286,7 +7295,7 @@ _PyDict_DetachFromObject(PyDictObject *mp, PyObject *obj)
 
     // We could be called with an unlocked dict when the caller knows the
     // values are already detached, so we assert after inline values check.
-    _Py_CRITICAL_SECTION_ASSERT_OBJECT_LOCKED(mp);
+    ASSERT_WORLD_STOPPED_OR_OBJ_LOCKED(mp);
     assert(mp->ma_values->embedded == 1);
     assert(mp->ma_values->valid == 1);
     assert(Py_TYPE(obj)->tp_flags & Py_TPFLAGS_INLINE_VALUES);
@@ -7417,18 +7426,52 @@ _PyDictKeys_DecRef(PyDictKeysObject *keys)
     dictkeys_decref(interp, keys, false);
 }
 
-uint32_t _PyDictKeys_GetVersionForCurrentState(PyInterpreterState *interp,
-                                               PyDictKeysObject *dictkeys)
+static inline uint32_t
+get_next_dict_keys_version(PyInterpreterState *interp)
 {
-    if (dictkeys->dk_version != 0) {
-        return dictkeys->dk_version;
-    }
+#ifdef Py_GIL_DISABLED
+    uint32_t v;
+    do {
+        v = _Py_atomic_load_uint32_relaxed(
+            &interp->dict_state.next_keys_version);
+        if (v == 0) {
+            return 0;
+        }
+    } while (!_Py_atomic_compare_exchange_uint32(
+        &interp->dict_state.next_keys_version, &v, v + 1));
+#else
     if (interp->dict_state.next_keys_version == 0) {
         return 0;
     }
     uint32_t v = interp->dict_state.next_keys_version++;
-    dictkeys->dk_version = v;
+#endif
     return v;
+}
+
+// In free-threaded builds the caller must ensure that the keys object is not
+// being mutated concurrently by another thread.
+uint32_t
+_PyDictKeys_GetVersionForCurrentState(PyInterpreterState *interp,
+                                      PyDictKeysObject *dictkeys)
+{
+    uint32_t dk_version = FT_ATOMIC_LOAD_UINT32_RELAXED(dictkeys->dk_version);
+    if (dk_version != 0) {
+        return dk_version;
+    }
+    dk_version = get_next_dict_keys_version(interp);
+    FT_ATOMIC_STORE_UINT32_RELAXED(dictkeys->dk_version, dk_version);
+    return dk_version;
+}
+
+uint32_t
+_PyDict_GetKeysVersionForCurrentState(PyInterpreterState *interp,
+                                      PyDictObject *dict)
+{
+    ASSERT_DICT_LOCKED((PyObject *) dict);
+    uint32_t dk_version =
+        _PyDictKeys_GetVersionForCurrentState(interp, dict->ma_keys);
+    ensure_shared_on_keys_version_assignment(dict);
+    return dk_version;
 }
 
 static inline int
