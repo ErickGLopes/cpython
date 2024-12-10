@@ -1439,7 +1439,7 @@ get_mimalloc_allocated_blocks(PyInterpreterState *interp)
 {
     size_t allocated_blocks = 0;
 #ifdef Py_GIL_DISABLED
-    for (PyThreadState *t = interp->threads.head; t != NULL; t = t->next) {
+    _Py_FOR_EACH_TSTATE_UNLOCKED(interp, t) {
         _PyThreadStateImpl *tstate = (_PyThreadStateImpl *)t;
         for (int i = 0; i < _Py_MIMALLOC_HEAP_COUNT; i++) {
             mi_heap_t *heap = &tstate->mimalloc.heaps[i];
@@ -2910,9 +2910,16 @@ static inline void
 _PyMem_DebugCheckGIL(const char *func)
 {
     if (!PyGILState_Check()) {
+#ifndef Py_GIL_DISABLED
         _Py_FatalErrorFunc(func,
                            "Python memory allocator called "
                            "without holding the GIL");
+#else
+        _Py_FatalErrorFunc(func,
+                           "Python memory allocator called "
+                           "without an active thread state. "
+                           "Are you trying to call it inside of a Py_BEGIN_ALLOW_THREADS block?");
+#endif
     }
 }
 
