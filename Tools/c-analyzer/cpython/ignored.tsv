@@ -319,6 +319,7 @@ Objects/exceptions.c	-	static_exceptions	-
 Objects/genobject.c	-	ASYNC_GEN_IGNORED_EXIT_MSG	-
 Objects/genobject.c	-	NON_INIT_CORO_MSG	-
 Objects/longobject.c	-	_PyLong_DigitValue	-
+Objects/longobject.c	-	PyLong_LAYOUT	-
 Objects/object.c	-	_Py_SwappedOp	-
 Objects/object.c	-	_Py_abstract_hack	-
 Objects/object.c	-	last_final_reftotal	-
@@ -739,7 +740,6 @@ Modules/expat/xmlrole.c	-	declClose	-
 Modules/expat/xmlrole.c	-	error	-
 
 ## other
-Modules/grpmodule.c	grp_getgrall_impl	getgrall_mutex	-
 Modules/_io/_iomodule.c	-	_PyIO_Module	-
 Modules/_sqlite/module.c	-	_sqlite3module	-
 Modules/clinic/md5module.c.h	_md5_md5	_keywords	-
